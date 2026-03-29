@@ -25,13 +25,13 @@ def seed_everything(seed=42):
 seed_everything(42)
 
 # ==========================================
-# 2. DEFINE TERNARY LAYER (WITH NAN PROTECTION)
+# 2. DEFINE TERNARY LAYER (BFLOAT16 OPTIMIZED)
 # ==========================================
 class TernaryLinear(nn.Linear):
     def forward(self, x):
         weight = self.weight - self.weight.mean()
-        # THE FIX: Added 1e-8 epsilon to prevent divide-by-zero NaN explosions
-        gamma = weight.abs().mean() + 1e-8 
+        # UPDATED: 1e-5 epsilon. BFloat16 can easily process this without rounding to zero.
+        gamma = weight.abs().mean() + 1e-5 
         w_q = torch.sign(weight) * torch.where(weight.abs() > 0.5 * gamma, 1, 0)
         out = nn.functional.linear(x, weight + (w_q - weight).detach(), self.bias)
         return out
@@ -104,16 +104,17 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=5e-6)
-    scaler = torch.amp.GradScaler('cuda')
+    optimizer = optim.AdamW(model.parameters(), lr=5e-7)
+    
+    # REMOVED: torch.amp.GradScaler('cuda') is no longer needed with BFloat16
 
-    accumulation_steps = 4 
+    accumulation_steps = 16 
     save_interval = 500    
     checkpoint_dir = "checkpoints_10k"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     start_step = 0
-    latest_checkpoint_path = None # Tracks the last safe state for auto-recovery
+    latest_checkpoint_path = None
 
     existing_checkpoints = glob.glob(f"{checkpoint_dir}/checkpoint_step_*.pt")
     if existing_checkpoints:
@@ -137,10 +138,11 @@ if __name__ == '__main__':
     print("\n" + "="*50)
     print(f"RESUME STATUS: Epoch {current_epoch_start + 1}, Skip {batches_to_skip_in_epoch} batches")
     print(f"Total Steps Per Epoch: {steps_per_epoch}")
+    print(f"Mixed Precision: Native BFloat16")
     print("="*50 + "\n")
 
     # Training Loop
-    num_epochs = 6
+    num_epochs = 3
     optimization_steps = start_step 
 
     for epoch in range(current_epoch_start, num_epochs):
@@ -154,7 +156,8 @@ if __name__ == '__main__':
 
             inputs = batch['input_ids'].to(device, non_blocking=True)
             
-            with torch.amp.autocast('cuda'):
+            # UPDATED: Enforcing torch.bfloat16
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 outputs = model(inputs, labels=inputs)
                 loss = outputs.loss / accumulation_steps
             
@@ -167,30 +170,26 @@ if __name__ == '__main__':
                 if latest_checkpoint_path and os.path.exists(latest_checkpoint_path):
                     print(f"[!] Purging poisoned memory and reloading safe state: {latest_checkpoint_path}")
                     
-                    # 1. Reload safe weights
                     checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
                     model.load_state_dict(checkpoint['model_state_dict'])
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     
-                    # 2. Reset the scaler to clear bad math gradients
-                    scaler = torch.amp.GradScaler('cuda')
                     optimizer.zero_grad()
                     
                     print("[!] ✅ Recovery complete. Skipping bad batch and continuing...\n")
-                    continue # Skip the backward pass for this batch and move to the next one
+                    continue
                 else:
                     print("[!] No safe checkpoint found to recover from. Exiting.")
                     exit(1)
 
-            # Normal Backward Pass
-            scaler.scale(loss).backward()
+            # UPDATED: Normal backward pass (no scaler needed)
+            loss.backward()
 
             if (i + 1) % accumulation_steps == 0:
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 
-                scaler.step(optimizer)
-                scaler.update()
+                # UPDATED: Normal optimizer step (no scaler needed)
+                optimizer.step()
                 optimizer.zero_grad()
                 optimization_steps += 1
                 
@@ -207,7 +206,6 @@ if __name__ == '__main__':
                         'optimizer_state_dict': optimizer.state_dict(),
                     }, checkpoint_path)
                     
-                    # Update the safe fallback path
                     latest_checkpoint_path = checkpoint_path
                     print(f"💾 Checkpoint saved: {checkpoint_path}")
 
