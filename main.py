@@ -25,12 +25,13 @@ def seed_everything(seed=42):
 seed_everything(42)
 
 # ==========================================
-# 2. DEFINE TERNARY LAYER
+# 2. DEFINE TERNARY LAYER (WITH NAN PROTECTION)
 # ==========================================
 class TernaryLinear(nn.Linear):
     def forward(self, x):
         weight = self.weight - self.weight.mean()
-        gamma = weight.abs().mean()
+        # THE FIX: Added 1e-8 epsilon to prevent divide-by-zero NaN explosions
+        gamma = weight.abs().mean() + 1e-8 
         w_q = torch.sign(weight) * torch.where(weight.abs() > 0.5 * gamma, 1, 0)
         out = nn.functional.linear(x, weight + (w_q - weight).detach(), self.bias)
         return out
@@ -103,18 +104,21 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=5e-7)
     scaler = torch.amp.GradScaler('cuda')
 
-    accumulation_steps = 4 
+    accumulation_steps = 16 
     save_interval = 500    
     checkpoint_dir = "checkpoints_10k"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     start_step = 0
+    latest_checkpoint_path = None # Tracks the last safe state for auto-recovery
+
     existing_checkpoints = glob.glob(f"{checkpoint_dir}/checkpoint_step_*.pt")
     if existing_checkpoints:
         latest_checkpoint = max(existing_checkpoints, key=os.path.getctime)
+        latest_checkpoint_path = latest_checkpoint
         print(f"\n[!] Resuming from: {latest_checkpoint}")
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -127,7 +131,6 @@ if __name__ == '__main__':
     total_batches = len(train_loader)
     steps_per_epoch = total_batches // accumulation_steps
     
-    # Logic to handle resuming in the middle of an epoch
     current_epoch_start = (start_step // steps_per_epoch)
     batches_to_skip_in_epoch = (start_step % steps_per_epoch) * accumulation_steps
 
@@ -146,7 +149,6 @@ if __name__ == '__main__':
         optimizer.zero_grad()
 
         for i, batch in enumerate(train_loader):
-            # THE RESUME FIX: Skip batches already seen in this specific epoch
             if epoch == current_epoch_start and i < batches_to_skip_in_epoch:
                 continue
 
@@ -156,15 +158,36 @@ if __name__ == '__main__':
                 outputs = model(inputs, labels=inputs)
                 loss = outputs.loss / accumulation_steps
             
+            # ==========================================
+            # SELF-HEALING PROTOCOL
+            # ==========================================
             if torch.isnan(loss):
-                print("\n[!] CRITICAL: NaN detected! Emergency Stop.")
-                exit(1)
+                print(f"\n[!] 🚨 CRITICAL: NaN detected at step {optimization_steps}! Initiating Auto-Recovery...")
+                
+                if latest_checkpoint_path and os.path.exists(latest_checkpoint_path):
+                    print(f"[!] Purging poisoned memory and reloading safe state: {latest_checkpoint_path}")
+                    
+                    # 1. Reload safe weights
+                    checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    
+                    # 2. Reset the scaler to clear bad math gradients
+                    scaler = torch.amp.GradScaler('cuda')
+                    optimizer.zero_grad()
+                    
+                    print("[!] ✅ Recovery complete. Skipping bad batch and continuing...\n")
+                    continue # Skip the backward pass for this batch and move to the next one
+                else:
+                    print("[!] No safe checkpoint found to recover from. Exiting.")
+                    exit(1)
 
+            # Normal Backward Pass
             scaler.scale(loss).backward()
 
             if (i + 1) % accumulation_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 
                 scaler.step(optimizer)
                 scaler.update()
@@ -172,7 +195,6 @@ if __name__ == '__main__':
                 optimization_steps += 1
                 
                 if optimization_steps % 10 == 0:
-                    # PROGRESS TRACKER LOGIC
                     current_epoch_step = optimization_steps % steps_per_epoch
                     progress_pct = (current_epoch_step / steps_per_epoch) * 100
                     print(f"Step: {optimization_steps} | Loss: {loss.item() * accumulation_steps:.4f} | Progress: {progress_pct:.2f}%")
@@ -184,6 +206,9 @@ if __name__ == '__main__':
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                     }, checkpoint_path)
+                    
+                    # Update the safe fallback path
+                    latest_checkpoint_path = checkpoint_path
                     print(f"💾 Checkpoint saved: {checkpoint_path}")
 
         print("\n--- Epoch Validation ---")
