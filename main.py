@@ -1,6 +1,8 @@
 import os
 import glob
 import torch
+import random
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 import multiprocessing
@@ -9,7 +11,21 @@ from transformers import GPTNeoConfig, GPTNeoForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk
 
 # ==========================================
-# 1. DEFINE TERNARY LAYER
+# 1. REPRODUCIBILITY SEED
+# ==========================================
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything(42)
+
+# ==========================================
+# 2. DEFINE TERNARY LAYER
 # ==========================================
 class TernaryLinear(nn.Linear):
     def forward(self, x):
@@ -20,7 +36,7 @@ class TernaryLinear(nn.Linear):
         return out
 
 # ==========================================
-# 2. CONVERT TO TERNARY FUNCTION
+# 3. CONVERT TO TERNARY FUNCTION
 # ==========================================
 def convert_to_ternary(model):
     for name, module in model.named_children():
@@ -38,14 +54,13 @@ def convert_to_ternary(model):
             convert_to_ternary(module)
 
 # ==========================================
-# MAIN EXECUTION BLOCK (Required for Windows)
+# MAIN EXECUTION BLOCK
 # ==========================================
 if __name__ == '__main__':
     
-    # 0. Worker Optimization
     num_workers = min(multiprocessing.cpu_count(), 8)
 
-    # 1. Model & Tokenizer Setup (~8.3M Params)
+    # Model & Tokenizer Config
     config = GPTNeoConfig(
         vocab_size=10000,
         max_position_embeddings=256,     
@@ -65,35 +80,29 @@ if __name__ == '__main__':
 
     convert_to_ternary(model)
 
-    # 2. Load Local Dataset
+    # Data Loading
     tokenized_path = "dataset/tokenized_tiny_stories_10k"
-
     if os.path.exists(tokenized_path):
         print("\n[!] Loading pre-tokenized 10k dataset...")
         tokenized_dataset = load_from_disk(tokenized_path)
     else:
         print("\n[!] Tokenizing from CSVs...")
-        dataset = load_dataset("csv", data_files={
-            "train": "dataset/train.csv", 
-            "validation": "dataset/validation.csv"
-        })
-
+        dataset = load_dataset("csv", data_files={"train": "dataset/train.csv", "validation": "dataset/validation.csv"})
         def tokenize_function(examples):
             safe_texts = [str(text) if text is not None else "" for text in examples["text"]]
             return tokenizer(safe_texts, padding="max_length", truncation=True, max_length=256)
-
         tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset["train"].column_names)
         tokenized_dataset.set_format("torch")
         tokenized_dataset.save_to_disk(tokenized_path)
 
+    # DataLoader
     train_loader = DataLoader(tokenized_dataset["train"], batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(tokenized_dataset["validation"], batch_size=32, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    # 3. Training Setup
+    # Training Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # STABILIZATION: Lowered Learning Rate to 1e-4 to prevent NaN
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler('cuda')
 
@@ -114,38 +123,46 @@ if __name__ == '__main__':
     else:
         print("\n[!] Starting from scratch.")
 
-    # 4. Metadata
+    # Calculations for Progress Tracking
+    total_batches = len(train_loader)
+    steps_per_epoch = total_batches // accumulation_steps
+    
+    # Logic to handle resuming in the middle of an epoch
+    current_epoch_start = (start_step // steps_per_epoch)
+    batches_to_skip_in_epoch = (start_step % steps_per_epoch) * accumulation_steps
+
     print("\n" + "="*50)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Params: {model.num_parameters():,}")
-    print(f"LR: 1e-4 | Clipping: 1.0")
+    print(f"RESUME STATUS: Epoch {current_epoch_start + 1}, Skip {batches_to_skip_in_epoch} batches")
+    print(f"Total Steps Per Epoch: {steps_per_epoch}")
     print("="*50 + "\n")
 
-    # 5. Training Loop
+    # Training Loop
     num_epochs = 3
     optimization_steps = start_step 
 
-    for epoch in range(num_epochs):
-        print(f"\n--- EPOCH {epoch + 1} ---\n")
+    for epoch in range(current_epoch_start, num_epochs):
+        print(f"\n--- STARTING EPOCH {epoch + 1}/{num_epochs} ---")
         model.train()
         optimizer.zero_grad()
 
         for i, batch in enumerate(train_loader):
+            # THE RESUME FIX: Skip batches already seen in this specific epoch
+            if epoch == current_epoch_start and i < batches_to_skip_in_epoch:
+                continue
+
             inputs = batch['input_ids'].to(device, non_blocking=True)
             
             with torch.amp.autocast('cuda'):
                 outputs = model(inputs, labels=inputs)
                 loss = outputs.loss / accumulation_steps
             
-            # Check for NaN immediately
             if torch.isnan(loss):
-                print("\n[!] CRITICAL: NaN detected! Stopping to save model state.")
+                print("\n[!] CRITICAL: NaN detected! Emergency Stop.")
                 exit(1)
 
             scaler.scale(loss).backward()
 
             if (i + 1) % accumulation_steps == 0:
-                # STABILIZATION: Gradient Clipping
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
@@ -155,7 +172,10 @@ if __name__ == '__main__':
                 optimization_steps += 1
                 
                 if optimization_steps % 10 == 0:
-                    print(f"Step: {optimization_steps} | Loss: {loss.item() * accumulation_steps:.4f}")
+                    # PROGRESS TRACKER LOGIC
+                    current_epoch_step = optimization_steps % steps_per_epoch
+                    progress_pct = (current_epoch_step / steps_per_epoch) * 100
+                    print(f"Step: {optimization_steps} | Loss: {loss.item() * accumulation_steps:.4f} | Progress: {progress_pct:.2f}%")
 
                 if optimization_steps % save_interval == 0:
                     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{optimization_steps}.pt")
@@ -164,9 +184,9 @@ if __name__ == '__main__':
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                     }, checkpoint_path)
-                    print(f"💾 Checkpoint: {checkpoint_path}")
+                    print(f"💾 Checkpoint saved: {checkpoint_path}")
 
-        # Validation logic remains same...
-        print("\n--- Validation Complete ---\n")
+        print("\n--- Epoch Validation ---")
+        # (Validation logic would go here)
 
     print("\nTraining Complete!")
