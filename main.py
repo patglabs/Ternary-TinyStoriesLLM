@@ -50,10 +50,10 @@ if __name__ == '__main__':
     num_workers = min(multiprocessing.cpu_count(), 8)
 
     # ==========================================
-    # 2. MODEL & TOKENIZER SETUP (~33M Params)
+    # 2. MODEL & TOKENIZER SETUP (~8.3M Params)
     # ==========================================
     config = GPTNeoConfig(
-        vocab_size=50257,
+        vocab_size=10000,                # SHRUNK FROM 50,257!
         max_position_embeddings=256,     
         window_size=256,
         hidden_size=256,                 
@@ -64,8 +64,13 @@ if __name__ == '__main__':
     )
 
     model = GPTNeoForCausalLM(config)
-    tokenizer = AutoTokenizer.from_pretrained("eleutherai/gpt-neo-125m")
-    tokenizer.pad_token = tokenizer.eos_token
+    
+    # Using a community-hosted 10k TinyStories BPE tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("vuiseng9/bpe-10.0k-tinystories")
+    
+    # Custom tokenizers sometimes lack a default padding token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Convert the initialized model to ternary
     convert_to_ternary(model)
@@ -73,13 +78,14 @@ if __name__ == '__main__':
     # ==========================================
     # 4. LOAD LOCAL DATASET 
     # ==========================================
-    tokenized_path = "dataset/tokenized_tiny_stories"
+    # CHANGED PATH: Must re-tokenize the CSVs with the new 10k dictionary!
+    tokenized_path = "dataset/tokenized_tiny_stories_10k"
 
     if os.path.exists(tokenized_path):
-        print("\n[!] Found pre-tokenized dataset! Loading from disk...")
+        print("\n[!] Found pre-tokenized 10k dataset! Loading from disk...")
         tokenized_dataset = load_from_disk(tokenized_path)
     else:
-        print("\n[!] Tokenized dataset not found. Tokenizing from CSVs...")
+        print("\n[!] Tokenized 10k dataset not found. Tokenizing from CSVs...")
         dataset = load_dataset("csv", data_files={
             "train": "dataset/train.csv", 
             "validation": "dataset/validation.csv"
@@ -96,8 +102,8 @@ if __name__ == '__main__':
         tokenized_dataset.save_to_disk(tokenized_path)
 
     # GPU Optimization: High batch size, and pin_memory=True for fast CPU-to-GPU transfers
-    train_loader = DataLoader(tokenized_dataset["train"], batch_size=128, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(tokenized_dataset["validation"], batch_size=128, shuffle=False, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(tokenized_dataset["train"], batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(tokenized_dataset["validation"], batch_size=32, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     # ==========================================
     # 5. TRAINING SETUP & CHECKPOINT LOGIC
@@ -111,10 +117,11 @@ if __name__ == '__main__':
     # GPU specific tool for Mixed Precision (Uses Tensor Cores)
     scaler = torch.amp.GradScaler('cuda')
 
-    accumulation_steps = 1 # Not needed with a batch size of 128
-    save_interval = 500    # Increased interval because steps will happen very fast
+    accumulation_steps = 4 
+    save_interval = 500    
 
-    checkpoint_dir = "checkpoints"
+    # CHANGED PATH: Prevent loading old 33M checkpoints into the new 8.3M model!
+    checkpoint_dir = "checkpoints_10k"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     start_step = 0
@@ -139,13 +146,13 @@ if __name__ == '__main__':
     # 6. METADATA PRINTING
     # ==========================================
     print("\n" + "="*50)
-    print("GPU TRAINING METADATA (33M DIET)")
+    print("GPU TRAINING METADATA (~8.3M DIET - 10k VOCAB)")
     print("="*50)
     print(f"Device:                 {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'})")
     print(f"Total Parameters:       {model.num_parameters():,}")
     print(f"Dataset Split (Train):  {len(tokenized_dataset['train']):,} examples")
     print(f"Dataset Split (Val):    {len(tokenized_dataset['validation']):,} examples")
-    print(f"Batch Size:             128")
+    print(f"Batch Size:             16")
     print(f"Mixed Precision (AMP):  Enabled")
     print(f"Learning Rate:          5e-4")
     print(f"Checkpoint Directory:   ./{checkpoint_dir}/")

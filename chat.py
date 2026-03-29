@@ -32,12 +32,12 @@ def convert_to_ternary(model):
             convert_to_ternary(module)
 
 # ==========================================
-# 2. LOAD MODEL & TOKENIZER
+# 2. LOAD MODEL & TOKENIZER (~8.3M Params)
 # ==========================================
-print("Loading architecture and tokenizer...")
+print("Loading architecture and 10k tokenizer...")
 
 config = GPTNeoConfig(
-    vocab_size=50257,
+    vocab_size=10000,                # MUST MATCH TRAINING (10k)
     max_position_embeddings=256,
     window_size=256,
     hidden_size=256,
@@ -50,8 +50,10 @@ config = GPTNeoConfig(
 model = GPTNeoForCausalLM(config)
 convert_to_ternary(model) # Convert to ternary BEFORE loading weights
 
-tokenizer = AutoTokenizer.from_pretrained("eleutherai/gpt-neo-125m")
-tokenizer.pad_token = tokenizer.eos_token
+# Load the matching 10k tokenizer
+tokenizer = AutoTokenizer.from_pretrained("vuiseng9/bpe-10.0k-tinystories")
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 # Automatically use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,7 +62,7 @@ model.to(device)
 # ==========================================
 # 3. LOAD LATEST CHECKPOINT
 # ==========================================
-checkpoint_dir = "checkpoints"
+checkpoint_dir = "checkpoints_10k" # MUST MATCH NEW FOLDER
 existing_checkpoints = glob.glob(f"{checkpoint_dir}/checkpoint_step_*.pt")
 
 if not existing_checkpoints:
@@ -87,7 +89,7 @@ model.eval() # Set model to evaluation mode
 # 4. CHAT LOOP
 # ==========================================
 print("\n" + "="*50)
-print("TERNARY AI CHAT INTERFACE")
+print("TERNARY AI CHAT INTERFACE (10k VOCAB)")
 print("Type 'quit' or 'exit' to stop.")
 print("="*50 + "\n")
 
