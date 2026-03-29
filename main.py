@@ -104,10 +104,10 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=5e-7)
+    optimizer = optim.AdamW(model.parameters(), lr=5e-6)
     scaler = torch.amp.GradScaler('cuda')
 
-    accumulation_steps = 16 
+    accumulation_steps = 4 
     save_interval = 500    
     checkpoint_dir = "checkpoints_10k"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -140,7 +140,7 @@ if __name__ == '__main__':
     print("="*50 + "\n")
 
     # Training Loop
-    num_epochs = 3
+    num_epochs = 6
     optimization_steps = start_step 
 
     for epoch in range(current_epoch_start, num_epochs):
