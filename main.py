@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 import multiprocessing
 from torch.utils.data import DataLoader
-from transformers import GPTNeoConfig, GPTNeoForCausalLM, AutoTokenizer
+from transformers import GPTNeoConfig, GPTNeoForCausalLM, GPT2TokenizerFast
 from datasets import load_dataset, load_from_disk
 
 # ==========================================
@@ -25,16 +25,12 @@ def seed_everything(seed=42):
 seed_everything(42)
 
 # ==========================================
-# 2. DEFINE TERNARY LAYER (BFLOAT16 OPTIMIZED)
-# ==========================================
-# ==========================================
 # 2. DEFINE TERNARY LAYER (FP32 OPTIMIZED FOR 2080 SUPER)
 # ==========================================
 class TernaryLinear(nn.Linear):
     def forward(self, x):
         weight = self.weight - self.weight.mean()
         
-        # ---> PUT IT RIGHT HERE <---
         # Standard 32-bit epsilon to prevent NaN on Turing GPUs
         gamma = weight.abs().mean() + 1e-8 
         
@@ -69,7 +65,7 @@ if __name__ == '__main__':
 
     # Model & Tokenizer Config
     config = GPTNeoConfig(
-        vocab_size=10000,
+        vocab_size=4096,                 # REDUCED TO 4K
         max_position_embeddings=256,     
         window_size=256,
         hidden_size=256,                 
@@ -80,20 +76,24 @@ if __name__ == '__main__':
     )
 
     model = GPTNeoForCausalLM(config)
-    tokenizer = AutoTokenizer.from_pretrained("vuiseng9/bpe-10.0k-tinystories")
     
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Explicitly load the raw 4k BPE files
+    tokenizer = GPT2TokenizerFast(
+        vocab_file="dataset/tokenizer_4k/vocab.json",
+        merges_file="dataset/tokenizer_4k/merges.txt",
+        eos_token="<|endoftext|>",
+        pad_token="<|padding|>"
+    )
 
     convert_to_ternary(model)
 
     # Data Loading
-    tokenized_path = "dataset/tokenized_tiny_stories_10k"
+    tokenized_path = "dataset/tokenized_tiny_stories_4k"
     if os.path.exists(tokenized_path):
-        print("\n[!] Loading pre-tokenized 10k dataset...")
+        print("\n[!] Loading pre-tokenized 4k dataset...")
         tokenized_dataset = load_from_disk(tokenized_path)
     else:
-        print("\n[!] Tokenizing from CSVs...")
+        print("\n[!] Tokenizing from CSVs with 4k vocabulary...")
         dataset = load_dataset("csv", data_files={"train": "dataset/train.csv", "validation": "dataset/validation.csv"})
         def tokenize_function(examples):
             safe_texts = [str(text) if text is not None else "" for text in examples["text"]]
@@ -102,21 +102,22 @@ if __name__ == '__main__':
         tokenized_dataset.set_format("torch")
         tokenized_dataset.save_to_disk(tokenized_path)
 
-    # DataLoader
-    train_loader = DataLoader(tokenized_dataset["train"], batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(tokenized_dataset["validation"], batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=True)
+    # DataLoader (BATCH SIZE INCREASED TO 128)
+    train_loader = DataLoader(tokenized_dataset["train"], batch_size=128, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(tokenized_dataset["validation"], batch_size=128, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     # Training Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-    
-    # REMOVED: torch.amp.GradScaler('cuda') is no longer needed with BFloat16
 
-    accumulation_steps = 8 
+    # ACCUMULATION REDUCED TO 4 (128 * 4 = 512 effective batch size)
+    accumulation_steps = 4 
     save_interval = 500    
-    checkpoint_dir = "checkpoints_10k"
+    
+    # NEW CHECKPOINT DIRECTORY
+    checkpoint_dir = "checkpoints_4k"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     start_step = 0
@@ -144,7 +145,7 @@ if __name__ == '__main__':
     print("\n" + "="*50)
     print(f"RESUME STATUS: Epoch {current_epoch_start + 1}, Skip {batches_to_skip_in_epoch} batches")
     print(f"Total Steps Per Epoch: {steps_per_epoch}")
-    print(f"using fp32 optimized ternary layers for 2080 Super")
+    print(f"using fp32 optimized ternary layers for 2080 Super | Vocab: 4096")
     print("="*50 + "\n")
 
     # Training Loop
@@ -187,13 +188,11 @@ if __name__ == '__main__':
                     print("[!] No safe checkpoint found to recover from. Exiting.")
                     exit(1)
 
-            # UPDATED: Normal backward pass (no scaler needed)
             loss.backward()
 
             if (i + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 
-                # UPDATED: Normal optimizer step (no scaler needed)
                 optimizer.step()
                 optimizer.zero_grad()
                 optimization_steps += 1
@@ -215,6 +214,5 @@ if __name__ == '__main__':
                     print(f"💾 Checkpoint saved: {checkpoint_path}")
 
         print("\n--- Epoch Validation ---")
-        # (Validation logic would go here)
 
     print("\nTraining Complete!")
