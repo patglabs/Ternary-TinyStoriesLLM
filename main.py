@@ -27,11 +27,17 @@ seed_everything(42)
 # ==========================================
 # 2. DEFINE TERNARY LAYER (BFLOAT16 OPTIMIZED)
 # ==========================================
+# ==========================================
+# 2. DEFINE TERNARY LAYER (FP32 OPTIMIZED FOR 2080 SUPER)
+# ==========================================
 class TernaryLinear(nn.Linear):
     def forward(self, x):
         weight = self.weight - self.weight.mean()
-        # UPDATED: 1e-5 epsilon. BFloat16 can easily process this without rounding to zero.
-        gamma = weight.abs().mean() + 1e-5 
+        
+        # ---> PUT IT RIGHT HERE <---
+        # Standard 32-bit epsilon to prevent NaN on Turing GPUs
+        gamma = weight.abs().mean() + 1e-8 
+        
         w_q = torch.sign(weight) * torch.where(weight.abs() > 0.5 * gamma, 1, 0)
         out = nn.functional.linear(x, weight + (w_q - weight).detach(), self.bias)
         return out
@@ -97,18 +103,18 @@ if __name__ == '__main__':
         tokenized_dataset.save_to_disk(tokenized_path)
 
     # DataLoader
-    train_loader = DataLoader(tokenized_dataset["train"], batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(tokenized_dataset["validation"], batch_size=32, shuffle=False, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(tokenized_dataset["train"], batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(tokenized_dataset["validation"], batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     # Training Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=5e-7)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     
     # REMOVED: torch.amp.GradScaler('cuda') is no longer needed with BFloat16
 
-    accumulation_steps = 16 
+    accumulation_steps = 8 
     save_interval = 500    
     checkpoint_dir = "checkpoints_10k"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -138,7 +144,7 @@ if __name__ == '__main__':
     print("\n" + "="*50)
     print(f"RESUME STATUS: Epoch {current_epoch_start + 1}, Skip {batches_to_skip_in_epoch} batches")
     print(f"Total Steps Per Epoch: {steps_per_epoch}")
-    print(f"Mixed Precision: Native BFloat16")
+    print(f"using fp32 optimized ternary layers for 2080 Super")
     print("="*50 + "\n")
 
     # Training Loop
@@ -156,10 +162,9 @@ if __name__ == '__main__':
 
             inputs = batch['input_ids'].to(device, non_blocking=True)
             
-            # UPDATED: Enforcing torch.bfloat16
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                outputs = model(inputs, labels=inputs)
-                loss = outputs.loss / accumulation_steps
+            # Pure FP32 - Native to 2080 Super
+            outputs = model(inputs, labels=inputs)
+            loss = outputs.loss / accumulation_steps
             
             # ==========================================
             # SELF-HEALING PROTOCOL
