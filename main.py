@@ -16,32 +16,28 @@ from torch.optim.lr_scheduler import LambdaLR
 # 1. CONFIGURATION
 # ==========================================
 class CFG:
-    # Model
-    vocab_size         = 4096
+    # Will be dynamically overwritten by actual tokenizer length
+    vocab_size         = 4096 
     max_len            = 256
     hidden_size        = 256
     num_layers         = 4
     num_heads          = 8
     intermediate_size  = 1024
 
-    # Training
     lr                 = 3e-4
     batch_size         = 32
-    accumulation_steps = 16       # Effective batch = 512
+    accumulation_steps = 16
     epochs             = 3
     warmup_steps       = 200
     grad_clip          = 1.0
     seed               = 42
 
-    # Paths
     dataset_path   = "dataset/tokenized_tiny_stories_4k"
     tokenizer_path = "dataset/tokenizer_4k"
     checkpoint_dir = "checkpoints_4k"
 
-    # Ternary — 0.5 == round-to-nearest in {-1, 0, +1} (BitNet 1.58 standard)
     ternary_threshold = 0.5
     eps               = 1e-8
-
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -54,49 +50,22 @@ def seed_everything(seed: int) -> None:
 
 seed_everything(CFG.seed)
 
-
 # ==========================================
-# 2. TERNARY LINEAR  (BitNet 1.58 style)
+# 2. TERNARY LINEAR
 # ==========================================
 class TernaryLinear(nn.Linear):
-    """
-    BitNet 1.58-style ternary weight quantisation.
-
-    Forward :  y = F.linear(x, w_q * scale, bias)   where w_q ∈ {-1, 0, +1}
-    Backward:  STE — gradient flows through as if weight were full-precision.
-
-    No activation normalisation is applied here.  GPT-Neo already wraps every
-    sub-layer with a pre-LayerNorm, so the inputs arriving here are already
-    unit-normalised.  Adding a second normalisation inside the linear layer
-    destroys scale information and causes NaN via near-zero-norm amplification.
-    """
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
-
-        # 1. Per-tensor L1 scale (BitNet 1.58 "alpha").
         scale = w.abs().mean().clamp(min=CFG.eps)
-
-        # 2. Normalise and snap to nearest integer in {-1, 0, +1}.
-        #    Values in (-0.5, 0.5) → 0;  outside → ±1.
+        
         w_hat = w / scale
         w_q   = torch.sign(w_hat) * (w_hat.abs() >= CFG.ternary_threshold).float()
-
-        # 3. Straight-Through Estimator.
-        #    Forward sees w_q * scale; backward gradient passes through w directly.
+        
         w_ste = w + (w_q * scale - w).detach()
-
         return nn.functional.linear(x, w_ste, self.bias)
 
-
 def convert_to_ternary(model: nn.Module) -> None:
-    """
-    Replace every non-lm_head nn.Linear with TernaryLinear.
-    The lm_head is kept in FP32 to provide stable output logits — standard
-    practice in all BitNet variants.
-    """
-    modules = list(model.named_modules())   # snapshot before modifications
-
+    modules = list(model.named_modules())
     for name, module in modules:
         if not isinstance(module, nn.Linear):
             continue
@@ -105,8 +74,6 @@ def convert_to_ternary(model: nn.Module) -> None:
 
         parent_name = name.rsplit(".", 1)[0] if "." in name else ""
         child_name  = name.rsplit(".", 1)[-1]
-
-        # Re-fetch parent from the (possibly already modified) model.
         parent = dict(model.named_modules()).get(parent_name, model)
 
         new_layer = TernaryLinear(
@@ -123,23 +90,16 @@ def convert_to_ternary(model: nn.Module) -> None:
         setattr(parent, child_name, new_layer)
         print(f"[INFO] Ternarized: {name}")
 
-
 # ==========================================
 # 3. FORWARD-PASS NaN DIAGNOSTIC
 # ==========================================
 def run_nan_diagnostic(model: nn.Module, tokenizer, device: torch.device) -> bool:
-    """
-    Run a single no-grad forward pass on a tiny random batch and report the
-    first module whose output is non-finite.  Returns True if the model is
-    clean, False if NaN/Inf was detected.
-    """
     print("\n[DIAG] Running forward-pass NaN diagnostic ...")
-
     first_bad: dict = {}
 
     def make_hook(layer_name: str):
         def hook(module, inp, out):
-            if first_bad:                          # already found one
+            if first_bad: 
                 return
             tensor = out[0] if isinstance(out, tuple) else out
             if isinstance(tensor, torch.Tensor) and not torch.isfinite(tensor).all():
@@ -155,9 +115,10 @@ def run_nan_diagnostic(model: nn.Module, tokenizer, device: torch.device) -> boo
         mod.register_forward_hook(make_hook(n))
         for n, mod in model.named_modules()
     ]
-
+    
     model.eval()
     try:
+        # CFG.vocab_size is now synced to len(tokenizer), making this safe
         ids = torch.randint(0, CFG.vocab_size, (2, CFG.max_len), device=device)
         with torch.no_grad():
             out = model(ids, labels=ids.clone())
@@ -175,28 +136,24 @@ def run_nan_diagnostic(model: nn.Module, tokenizer, device: torch.device) -> boo
               f"({first_bad['bad_frac']*100:.1f}% non-finite) | "
               f"input was {'clean' if first_bad['input_ok'] else 'ALSO BAD'} ***")
         return False
-
+    
     if not loss_ok:
-        print("[DIAG] NaN in loss but no single module flagged — "
-              "likely a masking or aggregation issue.")
+        print("[DIAG] NaN in loss but no single module flagged.")
         return False
 
-    print("[DIAG] All outputs finite. Model is clean.\n")
+    print("[DIAG] All outputs finite. Model architecture is clean.\n")
     return True
-
 
 # ==========================================
 # 4. LEARNING-RATE SCHEDULER
 # ==========================================
 def get_scheduler(optimizer, warmup_steps: int, total_steps: int) -> LambdaLR:
-    """Linear warmup → cosine decay to zero."""
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
         progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
     return LambdaLR(optimizer, lr_lambda)
-
 
 # ==========================================
 # 5. DATA LOADING
@@ -214,15 +171,12 @@ def get_dataset(tokenizer):
 
     def tokenize_fn(examples):
         texts = [str(t) if t is not None else "" for t in examples["text"]]
-        return tokenizer(texts, padding="max_length", truncation=True,
-                         max_length=CFG.max_len)
+        return tokenizer(texts, padding="max_length", truncation=True, max_length=CFG.max_len)
 
-    tokenized = raw.map(tokenize_fn, batched=True,
-                        remove_columns=raw["train"].column_names)
+    tokenized = raw.map(tokenize_fn, batched=True, remove_columns=raw["train"].column_names)
     tokenized.set_format("torch")
     tokenized.save_to_disk(CFG.dataset_path)
     return tokenized
-
 
 # ==========================================
 # 6. MAIN
@@ -236,32 +190,26 @@ if __name__ == "__main__":
         vocab_file  = f"{CFG.tokenizer_path}/vocab.json",
         merges_file = f"{CFG.tokenizer_path}/merges.txt",
         eos_token   = "<|endoftext|>",
-        pad_token   = "<|padding|>",
     )
+    
+    # Safely ensure padding token is registered
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '<|padding|>'})
+
+    # [CRITICAL FIX 1] Sync config exactly to the tokenizer's true size
+    CFG.vocab_size = len(tokenizer)
 
     # --- Model ---
-    # KEY FIX: use ALL-GLOBAL attention.
-    #
-    # GPT-Neo local attention chunks the sequence into blocks of window_size//2
-    # and has each block attend to itself plus the *previous* block.  When
-    # window_size == max_len (256 here), the entire sequence fits in one block,
-    # leaving the "look-back" region entirely masked.  Depending on the
-    # transformers version, this produces a row of all -inf before the softmax,
-    # which yields NaN.  For a model this small (hidden=256, 4 layers) there is
-    # no meaningful efficiency gain from local attention anyway.
     model_config = GPTNeoConfig(
         vocab_size              = CFG.vocab_size,
         max_position_embeddings = CFG.max_len,
         hidden_size             = CFG.hidden_size,
         num_layers              = CFG.num_layers,
         num_heads               = CFG.num_heads,
-        # All-global: pattern ["global"] repeated num_layers times.
         attention_types         = [[["global"], CFG.num_layers]],
-        # window_size is still required by GPTNeoConfig even if unused for
-        # global-only attention; set it to a safe value.
         window_size             = CFG.max_len,
         intermediate_size       = CFG.intermediate_size,
-        use_cache               = False,   # Required for gradient checkpointing
+        use_cache               = False,
     )
 
     model = GPTNeoForCausalLM(model_config)
@@ -270,18 +218,14 @@ if __name__ == "__main__":
     model.to(device)
 
     total_params   = sum(p.numel() for p in model.parameters())
-    ternary_params = sum(p.numel() for n, p in model.named_parameters()
-                         if "lm_head" not in n and p.dim() >= 2)
+    ternary_params = sum(p.numel() for n, p in model.named_parameters() if "lm_head" not in n and p.dim() >= 2)
+
     print(f"\n[INFO] Total params   : {total_params:,}")
     print(f"[INFO] Ternary params : {ternary_params:,}")
 
-    # --- Sanity check: one no-grad forward pass ---
-    # This will report the exact layer that misbehaves if NaN recurs.
+    # --- Sanity check ---
     if not run_nan_diagnostic(model, tokenizer, device):
-        raise RuntimeError(
-            "Model produces NaN/Inf on a clean forward pass. "
-            "Check the diagnostic output above for the offending layer."
-        )
+        raise RuntimeError("Model produces NaN/Inf on a clean forward pass.")
 
     # --- Data ---
     dataset      = get_dataset(tokenizer)
@@ -314,7 +258,7 @@ if __name__ == "__main__":
         if "scheduler_state_dict" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_step = ckpt["step"]
-
+        
     batches_already_done = start_step * CFG.accumulation_steps
 
     # --- Training ---
@@ -328,7 +272,7 @@ if __name__ == "__main__":
 
     current_step = start_step
     global_batch = 0
-    nan_streak   = 0          # Consecutive NaN batches — abort if too many
+    nan_streak   = 0
     MAX_NAN_STREAK = 50
 
     for epoch in range(CFG.epochs):
@@ -337,12 +281,18 @@ if __name__ == "__main__":
         running_loss = 0.0
 
         for batch in train_loader:
-            # Skip already-processed batches when resuming
             if global_batch < batches_already_done:
                 global_batch += 1
                 continue
 
-            ids    = batch["input_ids"].to(device, non_blocking=True)
+            ids = batch["input_ids"].to(device, non_blocking=True)
+            
+            # [CRITICAL FIX 2] Neutralize rogue out-of-bounds tokens from stale cached datasets.
+            # This prevents the CUDA assert crash without forcing you to re-tokenize.
+            out_of_bounds = ids >= CFG.vocab_size
+            if out_of_bounds.any():
+                ids[out_of_bounds] = tokenizer.pad_token_id
+
             labels = ids.clone()
             labels[labels == tokenizer.pad_token_id] = -100
 
@@ -351,17 +301,13 @@ if __name__ == "__main__":
 
             if not torch.isfinite(loss):
                 nan_streak += 1
-                print(f"[WARN] Non-finite loss at step {current_step}, "
-                      f"batch {global_batch}  (streak: {nan_streak})")
+                print(f"[WARN] Non-finite loss at step {current_step}, batch {global_batch}  (streak: {nan_streak})")
                 if nan_streak >= MAX_NAN_STREAK:
-                    raise RuntimeError(
-                        f"Aborted: {MAX_NAN_STREAK} consecutive non-finite losses. "
-                        "Re-run with run_nan_diagnostic to locate the offending layer."
-                    )
+                    raise RuntimeError("Aborted: Maximum consecutive non-finite losses reached.")
                 optimizer.zero_grad()
                 global_batch += 1
                 continue
-
+            
             nan_streak = 0
             loss.backward()
             running_loss += loss.item()
@@ -376,8 +322,7 @@ if __name__ == "__main__":
                 if current_step % 10 == 0:
                     avg_loss = running_loss * CFG.accumulation_steps / 10
                     lr_now   = scheduler.get_last_lr()[0]
-                    print(f"Epoch {epoch+1} | Step {current_step:5d} | "
-                          f"Loss: {avg_loss:.4f} | LR: {lr_now:.2e}")
+                    print(f"Epoch {epoch+1} | Step {current_step:5d} | Loss: {avg_loss:.4f} | LR: {lr_now:.2e}")
                     running_loss = 0.0
 
                 if current_step % 250 == 0:
