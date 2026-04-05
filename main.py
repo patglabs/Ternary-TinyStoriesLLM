@@ -9,9 +9,9 @@ import torch.optim as optim
 import multiprocessing
 from torch.utils.data import DataLoader
 from transformers import GPTNeoConfig, GPTNeoForCausalLM, GPT2TokenizerFast
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Dataset, DatasetDict
 from torch.optim.lr_scheduler import LambdaLR
-
+import pandas as pd
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
@@ -163,19 +163,58 @@ def get_dataset(tokenizer):
         print("[INFO] Loading tokenized dataset from disk...")
         return load_from_disk(CFG.dataset_path)
 
-    print("[INFO] Tokenizing dataset from CSV...")
-    raw = load_dataset("csv", data_files={
-        "train":      "dataset/train.csv",
-        "validation": "dataset/validation.csv",
+    print("[INFO] Loading and cleaning raw CSVs with Pandas...")
+    
+    def safe_load_csv(filepath):
+        # Read the first line to check for a header
+        df = pd.read_csv(filepath, nrows=0)
+        
+        if "text" in df.columns:
+            # Header exists and is named "text"
+            df = pd.read_csv(filepath)
+        else:
+            # No header, or wrongly named header. Force "text" as the column name.
+            df = pd.read_csv(filepath, header=None, names=["text"])
+            
+        # Drop completely empty rows or NaNs
+        df = df.dropna(subset=["text"])
+        df = df[df["text"].astype(str).str.strip() != ""]
+        return df
+
+    try:
+        df_train = safe_load_csv("dataset/train.csv")
+        df_val = safe_load_csv("dataset/validation.csv")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read CSV files: {e}")
+
+    # Convert cleaned pandas dataframes back to HuggingFace Datasets
+    raw = DatasetDict({
+        "train": Dataset.from_pandas(df_train, preserve_index=False),
+        "validation": Dataset.from_pandas(df_val, preserve_index=False)
     })
 
-    def tokenize_fn(examples):
-        texts = [str(t) if t is not None else "" for t in examples["text"]]
-        return tokenizer(texts, padding="max_length", truncation=True, max_length=CFG.max_len)
+    print(f"[INFO] Found {len(raw['train'])} training stories and {len(raw['validation'])} validation stories.")
 
-    tokenized = raw.map(tokenize_fn, batched=True, remove_columns=raw["train"].column_names)
+    def tokenize_fn(examples):
+        return tokenizer(
+            examples["text"], 
+            padding="max_length", 
+            truncation=True, 
+            max_length=CFG.max_len
+        )
+
+    print("[INFO] Tokenizing...")
+    tokenized = raw.map(tokenize_fn, batched=True, remove_columns=["text"])
     tokenized.set_format("torch")
+    
+    # Ultimate Sanity Check: Ensure the first item isn't just padding
+    sample_ids = tokenized["train"][0]["input_ids"]
+    if (sample_ids == tokenizer.pad_token_id).all():
+        raise ValueError("[CRASH] Tokenization resulted in entirely empty tokens! Check the tokenizer logic.")
+
     tokenized.save_to_disk(CFG.dataset_path)
+    print(f"[INFO] Successfully saved clean tokenized data to {CFG.dataset_path}")
+    
     return tokenized
 
 # ==========================================
