@@ -8,15 +8,15 @@ import torch.nn as nn
 import torch.optim as optim
 import multiprocessing
 from torch.utils.data import DataLoader
-from transformers import GPTNeoConfig, GPTNeoForCausalLM, GPT2TokenizerFast
+from transformers import GPTNeoConfig, GPTNeoForCausalLM, PreTrainedTokenizerFast
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
+
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
 class CFG:
-    # Will be dynamically overwritten by actual tokenizer length
     vocab_size         = 4096 
     max_len            = 256
     hidden_size        = 256
@@ -28,7 +28,7 @@ class CFG:
     batch_size         = 32
     accumulation_steps = 16
     epochs             = 3
-    warmup_steps       = 200
+    warmup_steps       = 400
     grad_clip          = 1.0
     seed               = 42
 
@@ -37,7 +37,7 @@ class CFG:
     checkpoint_dir = "checkpoints_4k"
 
     ternary_threshold = 0.5
-    eps               = 1e-8
+    eps               = 1e-5
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -56,6 +56,7 @@ seed_everything(CFG.seed)
 class TernaryLinear(nn.Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
+        w = w - w.mean()
         scale = w.abs().mean().clamp(min=CFG.eps)
         
         w_hat = w / scale
@@ -67,9 +68,7 @@ class TernaryLinear(nn.Linear):
 def convert_to_ternary(model: nn.Module) -> None:
     modules = list(model.named_modules())
     for name, module in modules:
-        if not isinstance(module, nn.Linear):
-            continue
-        if "lm_head" in name:
+        if not isinstance(module, nn.Linear) or "lm_head" in name:
             continue
 
         parent_name = name.rsplit(".", 1)[0] if "." in name else ""
@@ -83,7 +82,7 @@ def convert_to_ternary(model: nn.Module) -> None:
         ).to(module.weight.device)
 
         with torch.no_grad():
-            nn.init.xavier_uniform_(new_layer.weight)
+            nn.init.normal_(new_layer.weight, std=0.02)
             if new_layer.bias is not None:
                 nn.init.zeros_(new_layer.bias)
 
@@ -95,68 +94,22 @@ def convert_to_ternary(model: nn.Module) -> None:
 # ==========================================
 def run_nan_diagnostic(model: nn.Module, tokenizer, device: torch.device) -> bool:
     print("\n[DIAG] Running forward-pass NaN diagnostic ...")
-    first_bad: dict = {}
-
-    def make_hook(layer_name: str):
-        def hook(module, inp, out):
-            if first_bad: 
-                return
-            tensor = out[0] if isinstance(out, tuple) else out
-            if isinstance(tensor, torch.Tensor) and not torch.isfinite(tensor).all():
-                bad_frac = (~torch.isfinite(tensor)).float().mean().item()
-                in0 = inp[0] if isinstance(inp, tuple) else inp
-                in_ok = torch.isfinite(in0).all().item() if isinstance(in0, torch.Tensor) else True
-                first_bad["name"]     = layer_name
-                first_bad["bad_frac"] = bad_frac
-                first_bad["input_ok"] = in_ok
-        return hook
-
-    handles = [
-        mod.register_forward_hook(make_hook(n))
-        for n, mod in model.named_modules()
-    ]
-    
     model.eval()
     try:
-        # CFG.vocab_size is now synced to len(tokenizer), making this safe
         ids = torch.randint(0, CFG.vocab_size, (2, CFG.max_len), device=device)
         with torch.no_grad():
             out = model(ids, labels=ids.clone())
         loss_ok = torch.isfinite(out.loss)
     except Exception as exc:
-        print(f"[DIAG] Forward pass threw an exception: {exc}")
+        print(f"[DIAG] Exception: {exc}")
         loss_ok = torch.tensor(False)
-    finally:
-        for h in handles:
-            h.remove()
-        model.train()
-
-    if first_bad:
-        print(f"[DIAG] *** First NaN/Inf detected in: '{first_bad['name']}' "
-              f"({first_bad['bad_frac']*100:.1f}% non-finite) | "
-              f"input was {'clean' if first_bad['input_ok'] else 'ALSO BAD'} ***")
-        return False
     
-    if not loss_ok:
-        print("[DIAG] NaN in loss but no single module flagged.")
-        return False
-
-    print("[DIAG] All outputs finite. Model architecture is clean.\n")
-    return True
+    if loss_ok:
+        print("[DIAG] All outputs finite. Model architecture is clean.\n")
+    return bool(loss_ok)
 
 # ==========================================
-# 4. LEARNING-RATE SCHEDULER
-# ==========================================
-def get_scheduler(optimizer, warmup_steps: int, total_steps: int) -> LambdaLR:
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-    return LambdaLR(optimizer, lr_lambda)
-
-# ==========================================
-# 5. DATA LOADING
+# 4. DATA LOADING
 # ==========================================
 def get_dataset(tokenizer):
     if os.path.exists(CFG.dataset_path):
@@ -166,17 +119,12 @@ def get_dataset(tokenizer):
     print("[INFO] Loading and cleaning raw CSVs with Pandas...")
     
     def safe_load_csv(filepath):
-        # Read the first line to check for a header
         df = pd.read_csv(filepath, nrows=0)
-        
         if "text" in df.columns:
-            # Header exists and is named "text"
             df = pd.read_csv(filepath)
         else:
-            # No header, or wrongly named header. Force "text" as the column name.
             df = pd.read_csv(filepath, header=None, names=["text"])
             
-        # Drop completely empty rows or NaNs
         df = df.dropna(subset=["text"])
         df = df[df["text"].astype(str).str.strip() != ""]
         return df
@@ -187,7 +135,6 @@ def get_dataset(tokenizer):
     except Exception as e:
         raise RuntimeError(f"Failed to read CSV files: {e}")
 
-    # Convert cleaned pandas dataframes back to HuggingFace Datasets
     raw = DatasetDict({
         "train": Dataset.from_pandas(df_train, preserve_index=False),
         "validation": Dataset.from_pandas(df_val, preserve_index=False)
@@ -207,7 +154,6 @@ def get_dataset(tokenizer):
     tokenized = raw.map(tokenize_fn, batched=True, remove_columns=["text"])
     tokenized.set_format("torch")
     
-    # Ultimate Sanity Check: Ensure the first item isn't just padding
     sample_ids = tokenized["train"][0]["input_ids"]
     if (sample_ids == tokenizer.pad_token_id).all():
         raise ValueError("[CRASH] Tokenization resulted in entirely empty tokens! Check the tokenizer logic.")
@@ -218,24 +164,21 @@ def get_dataset(tokenizer):
     return tokenized
 
 # ==========================================
-# 6. MAIN
+# 5. MAIN
 # ==========================================
 if __name__ == "__main__":
     os.makedirs(CFG.checkpoint_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Tokenizer ---
-    tokenizer = GPT2TokenizerFast(
-        vocab_file  = f"{CFG.tokenizer_path}/vocab.json",
-        merges_file = f"{CFG.tokenizer_path}/merges.txt",
-        eos_token   = "<|endoftext|>",
+    # Load the full tokenizer pipeline directly from the JSON
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=f"{CFG.tokenizer_path}/tokenizer.json",
+        bos_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+        pad_token="<|padding|>"
     )
-    
-    # Safely ensure padding token is registered
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({'pad_token': '<|padding|>'})
 
-    # [CRITICAL FIX 1] Sync config exactly to the tokenizer's true size
     CFG.vocab_size = len(tokenizer)
 
     # --- Model ---
@@ -262,30 +205,28 @@ if __name__ == "__main__":
     print(f"\n[INFO] Total params   : {total_params:,}")
     print(f"[INFO] Ternary params : {ternary_params:,}")
 
-    # --- Sanity check ---
     if not run_nan_diagnostic(model, tokenizer, device):
-        raise RuntimeError("Model produces NaN/Inf on a clean forward pass.")
+        raise RuntimeError("Model architecture NaN failure.")
 
     # --- Data ---
     dataset      = get_dataset(tokenizer)
     num_workers  = min(multiprocessing.cpu_count(), 8)
     train_loader = DataLoader(
-        dataset["train"],
-        batch_size  = CFG.batch_size,
-        shuffle     = True,
-        num_workers = num_workers,
-        pin_memory  = True,
+        dataset["train"], 
+        batch_size=CFG.batch_size, 
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
     )
 
-    total_batches   = len(train_loader)
-    steps_per_epoch = total_batches // CFG.accumulation_steps
-    total_steps     = steps_per_epoch * CFG.epochs
-
-    # --- Optimiser + Scheduler ---
     optimizer = optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=0.01)
-    scheduler = get_scheduler(optimizer, CFG.warmup_steps, total_steps)
-
-    # --- Checkpoint resume ---
+    total_steps = (len(train_loader) // CFG.accumulation_steps) * CFG.epochs
+    
+    def lr_lambda(step):
+        if step < CFG.warmup_steps: return float(step) / float(max(1, CFG.warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * (step - CFG.warmup_steps) / (total_steps - CFG.warmup_steps))))
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    
     start_step = 0
     ckpt_files = glob.glob(f"{CFG.checkpoint_dir}/checkpoint_step_*.pt")
     if ckpt_files:
@@ -297,22 +238,19 @@ if __name__ == "__main__":
         if "scheduler_state_dict" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_step = ckpt["step"]
-        
+
     batches_already_done = start_step * CFG.accumulation_steps
 
-    # --- Training ---
     print("\n" + "=" * 50)
     print("TERNARY LANGUAGE MODEL TRAINING")
     print(f"  Device          : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-    print(f"  Steps / epoch   : {steps_per_epoch}  |  Total steps: {total_steps}")
+    print(f"  Steps / epoch   : {len(train_loader) // CFG.accumulation_steps}  |  Total steps: {total_steps}")
     print(f"  Effective batch : {CFG.batch_size * CFG.accumulation_steps}")
-    print(f"  Resuming at step: {start_step}")
     print("=" * 50 + "\n")
 
     current_step = start_step
     global_batch = 0
     nan_streak   = 0
-    MAX_NAN_STREAK = 50
 
     for epoch in range(CFG.epochs):
         model.train()
@@ -324,24 +262,33 @@ if __name__ == "__main__":
                 global_batch += 1
                 continue
 
-            ids = batch["input_ids"].to(device, non_blocking=True)
+            ids = batch["input_ids"].to(device, dtype=torch.long, non_blocking=True)
+            ids = torch.clamp(ids, min=0, max=CFG.vocab_size - 1)
             
-            # [CRITICAL FIX 2] Neutralize rogue out-of-bounds tokens from stale cached datasets.
-            # This prevents the CUDA assert crash without forcing you to re-tokenize.
-            out_of_bounds = ids >= CFG.vocab_size
-            if out_of_bounds.any():
-                ids[out_of_bounds] = tokenizer.pad_token_id
+            if "attention_mask" in batch:
+                mask = batch["attention_mask"].to(device, dtype=torch.long, non_blocking=True)
+            else:
+                mask = (ids != tokenizer.pad_token_id).long()
 
             labels = ids.clone()
-            labels[labels == tokenizer.pad_token_id] = -100
+            labels[mask == 0] = -100
 
-            outputs = model(ids, labels=labels)
-            loss    = outputs.loss / CFG.accumulation_steps
+            if (labels != -100).sum() == 0:
+                print(f"[WARN] Batch {global_batch} contains entirely padding tokens. Skipping.")
+                global_batch += 1
+                continue
+
+            outputs = model(input_ids=ids, attention_mask=mask, labels=labels)
+            
+            # Soft scaling to protect Softmax from overflow in ternary space
+            logits = outputs.logits / 2.0 
+            loss = nn.functional.cross_entropy(logits.view(-1, CFG.vocab_size), labels.view(-1))
+            loss = loss / CFG.accumulation_steps
 
             if not torch.isfinite(loss):
                 nan_streak += 1
-                print(f"[WARN] Non-finite loss at step {current_step}, batch {global_batch}  (streak: {nan_streak})")
-                if nan_streak >= MAX_NAN_STREAK:
+                print(f"[WARN] Non-finite loss at step {current_step}, batch {global_batch} (streak: {nan_streak})")
+                if nan_streak >= 50: 
                     raise RuntimeError("Aborted: Maximum consecutive non-finite losses reached.")
                 optimizer.zero_grad()
                 global_batch += 1
@@ -359,7 +306,7 @@ if __name__ == "__main__":
                 current_step += 1
 
                 if current_step % 10 == 0:
-                    avg_loss = running_loss * CFG.accumulation_steps / 10
+                    avg_loss = running_loss / 10
                     lr_now   = scheduler.get_last_lr()[0]
                     print(f"Epoch {epoch+1} | Step {current_step:5d} | Loss: {avg_loss:.4f} | LR: {lr_now:.2e}")
                     running_loss = 0.0
