@@ -1,6 +1,6 @@
 venv
 dataset
-checkpoints
+*pt
 .git
 __pycache__/
-*.pt
+checkpoints_4k/
