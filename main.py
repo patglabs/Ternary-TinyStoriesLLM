@@ -25,8 +25,8 @@ class CFG:
     intermediate_size  = 1024
 
     lr                 = 3e-4
-    batch_size         = 32
-    accumulation_steps = 16
+    batch_size         = 64
+    accumulation_steps = 8
     epochs             = 3
     warmup_steps       = 400
     grad_clip          = 1.0
