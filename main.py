@@ -25,8 +25,8 @@ class CFG:
     intermediate_size  = 1024
 
     lr                 = 3e-4
-    batch_size         = 64
-    accumulation_steps = 8
+    batch_size         = 128
+    accumulation_steps = 4
     epochs             = 3
     warmup_steps       = 400
     grad_clip          = 1.0
@@ -278,11 +278,16 @@ if __name__ == "__main__":
                 global_batch += 1
                 continue
 
-            outputs = model(input_ids=ids, attention_mask=mask, labels=labels)
+            # We remove labels=labels here to save VRAM, since we calculate loss manually anyway
+            outputs = model(input_ids=ids, attention_mask=mask)
             
-            # Soft scaling to protect Softmax from overflow in ternary space
             logits = outputs.logits / 2.0 
-            loss = nn.functional.cross_entropy(logits.view(-1, CFG.vocab_size), labels.view(-1))
+            
+            # [CRITICAL FIX] Shift logits and labels so the model predicts the NEXT word
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            loss = nn.functional.cross_entropy(shift_logits.view(-1, CFG.vocab_size), shift_labels.view(-1))
             loss = loss / CFG.accumulation_steps
 
             if not torch.isfinite(loss):
