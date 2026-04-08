@@ -1,6 +1,6 @@
-venv
-dataset
+V1-old/venv
+V1-old/dataset
 *pt
-.git
-__pycache__/
-checkpoints_4k/
+V1-old/.git
+V1-old/__pycache__/
+V1-old/checkpoints_4k/
